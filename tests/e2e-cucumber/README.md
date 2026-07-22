@@ -98,7 +98,8 @@ Scenarios carry stable-id and capability tags:
 | Tag | Meaning |
 |---|---|
 | `@id:<slug>` | Stable scenario id. Keys the expectation matrix and the report grid; every scenario has one. |
-| `@requires-gpu` | Needs a real AMD GPU. Resolves to **skip** (n/a) on a host with none (e.g. the mock job). |
+| `@requires-gpu` | Needs a real AMD GPU. Resolves to **skip** (n/a) on a host with none (e.g. the mock or hosted WSL job). |
+| `@requires-wsl` | Needs a real WSL host. Resolves to **skip** on native Linux, native Windows, and other environments. |
 | `@requires-engine:<vllm\|lemonade>` | Pins the serve engine. Resolves to skip where that engine can't start (e.g. vLLM on a lemonade-only Strix host). |
 | `@requires-os:<linux\|windows>` | Premise is OS-specific; skip on other OSes. |
 | `@serve-timeout:<secs>` | Lengthen the serve-readiness wait for a genuinely slow serve (e.g. a large model). |
@@ -129,15 +130,18 @@ self-hosted runner can never stall `ci.yml`'s merge-required checks:
 
 | Job | Workflow | Platform | Blocking |
 |---|---|---|---|
-| `e2e` | `ci.yml` | Mock (no GPU, GitHub-hosted) | yes |
+| `e2e` | `ci.yml` | Mock (no GPU, GitHub-hosted Linux) | yes |
+| `e2e-wsl` | `ci.yml` | WSL2 / Ubuntu (no GPU, GitHub-hosted Windows) | no |
 | `e2e-gpu` | `e2e-selfhosted.yml` | MI300X (self-hosted) | no |
 | `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo / Ubuntu (self-hosted) | no |
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo / Windows (self-hosted) | no |
 
 The blocking mock job passes when every applicable scenario is pass-or-xfail with
-no XPASS or unexpected failure; the GPU jobs are non-blocking. Each workflow has
-its own `e2e-report` job: `ci.yml`'s consolidates the mock platform, and
-`e2e-selfhosted.yml`'s consolidates the self-hosted platforms.
+no XPASS or unexpected failure; the hosted WSL and GPU jobs are non-blocking. The
+WSL job validates the real WSL2 host boundary, Linux build, and CLI behavior; it
+has no AMD GPU and does not replace GPU-on-WSL hardware coverage. Each workflow
+has its own `e2e-report` job: `ci.yml`'s consolidates the GitHub-hosted platforms
+(mock and WSL2), and `e2e-selfhosted.yml`'s consolidates the self-hosted ones.
 
 The nightly workflow runs three non-blocking jobs — the existing MI300X job and
 new Strix Halo jobs on Ubuntu and Windows — with `E2E_INCLUDE_NIGHTLY=1`. The
