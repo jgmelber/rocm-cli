@@ -21,6 +21,7 @@ mod e2e {
     pub mod examine_steps;
     pub mod runtime_steps;
     pub mod serving_steps;
+    pub mod skill_steps;
     pub mod tui_driver;
 }
 
@@ -70,6 +71,10 @@ pub struct E2eWorld {
     /// launch step knows to pass `--chat-mock` (deterministic offline agent, no
     /// endpoint detection) instead of driving the real detection/consent path.
     pub chat_use_mock: bool,
+    /// Raw text of `skills/rocm-doctor/reference.md`, loaded by the rocm-doctor
+    /// skill scenarios. That document is the EXPECTED-value fixture for the
+    /// skill↔CLI contract checks — see `e2e::skill_steps`.
+    pub skill_reference: Option<String>,
 }
 
 /// Resolve a CI-provided shared-directory env var to a validated, existing path.
@@ -174,6 +179,7 @@ impl Default for E2eWorld {
             expect_xfail: false,
             tui: None,
             chat_use_mock: false,
+            skill_reference: None,
         }
     }
 }
