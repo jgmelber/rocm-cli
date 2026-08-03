@@ -1064,12 +1064,31 @@ fn sha256_hex(bytes: &[u8]) -> String {
 fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().context("file path has no parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-    let tmp = path.with_extension(format!("tmp-{}", unix_time_millis()));
-    fs::write(&tmp, bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
-    fs::rename(&tmp, path).or_else(|_| {
-        let _ = fs::remove_file(path);
-        fs::rename(&tmp, path)
-    })?;
+    // Preserve the full file name so multi-extension paths keep their
+    // extensions, and remove the temp file on every failure path so repeated
+    // attempts cannot accumulate orphans.
+    let file_name = path
+        .file_name()
+        .context("file path has no file name")?
+        .to_string_lossy()
+        .into_owned();
+    let tmp = parent.join(format!(
+        "{file_name}.tmp-{}-{}",
+        std::process::id(),
+        unix_time_millis()
+    ));
+    if let Err(error) = fs::write(&tmp, bytes) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error).with_context(|| format!("failed to write {}", tmp.display()));
+    }
+    fs::rename(&tmp, path)
+        .or_else(|_| {
+            let _ = fs::remove_file(path);
+            fs::rename(&tmp, path)
+        })
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })?;
     Ok(())
 }
 
@@ -5051,6 +5070,40 @@ mod tests {
     use clap::CommandFactory;
     use rocm_core::ModelRecipeArtifactSourcePolicyRecord;
     use std::path::PathBuf;
+
+    /// Regression: a failed write must not leave a `.tmp-*` scratch file
+    /// behind. Mirrors the test in `apps/rocm/src/therock.rs`.
+    ///
+    /// Ignored by default: it fills `/dev/shm` to provoke ENOSPC, which is
+    /// shared with anything else on the host.
+    #[test]
+    #[ignore = "fills /dev/shm to provoke ENOSPC; not safe to run concurrently"]
+    fn write_file_atomically_cleans_up_temp_on_write_failure() {
+        let shm = std::path::Path::new("/dev/shm");
+        if !shm.is_dir() {
+            eprintln!("skipping: /dev/shm unavailable");
+            return;
+        }
+        let dir = shm.join(format!("rocmd-enospc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("manifest.json");
+        let payload = vec![b'x'; 256 * 1024 * 1024];
+
+        write_file_atomically(&dest, &payload)
+            .expect_err("writing past the end of the filesystem should fail");
+        let leftovers: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "failed write left files behind: {leftovers:?}"
+        );
+
+        assert!(!dest.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn last_cr_segment_keeps_final_progress_redraw() {

@@ -118,6 +118,16 @@ pub fn parse_http_endpoint(endpoint_url: &str) -> Option<(String, u16)> {
     Some((host.to_owned(), port.parse().ok()?))
 }
 
+/// Suffix marking an in-progress download. Callers that sweep a cache directory
+/// can recognize (and safely delete) leftovers by this pattern.
+pub const PARTIAL_DOWNLOAD_SUFFIX: &str = ".part";
+
+/// Download `url` to `destination`, streaming the body to disk.
+///
+/// The body is written to a sibling `.part` file and renamed into place only
+/// after the transfer completes, so an interrupted download never leaves a
+/// truncated file at `destination` where callers would mistake it for a
+/// complete artifact. The partial file is removed on every failure path.
 pub fn download_file_to_path(url: &str, destination: &Path, timeout: Duration) -> Result<()> {
     let response = ureq::get(url)
         .timeout(timeout)
@@ -143,10 +153,58 @@ pub fn download_file_to_path(url: &str, destination: &Path, timeout: Duration) -
         )?;
     }
     let mut reader = response.into_reader();
-    let mut file = fs::File::create(destination)
-        .with_context(|| format!("failed to create {}", destination.display()))?;
-    std::io::copy(&mut reader, &mut file)
-        .map_err(|error| disk_space::map_write_error(error, destination))?;
+    stream_to_path_atomically(&mut reader, destination)
+        .with_context(|| format!("failed to download {url}"))
+}
+
+/// Stream `reader` to `destination` via a sibling `.part` file, renaming into
+/// place only once the whole body is written. Removes the partial file if
+/// anything fails, so retries cannot accumulate orphans.
+pub fn stream_to_path_atomically(reader: &mut dyn std::io::Read, destination: &Path) -> Result<()> {
+    let parent = destination
+        .parent()
+        .context("download destination has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+
+    // Keep the original file name intact and append the marker, so a
+    // multi-extension artifact (`sdk.tar.gz`) yields `sdk.tar.gz.part-<id>`
+    // rather than losing an extension the way `with_extension` would.
+    let file_name = destination
+        .file_name()
+        .context("download destination has no file name")?
+        .to_string_lossy()
+        .into_owned();
+    let partial = parent.join(format!(
+        "{file_name}{PARTIAL_DOWNLOAD_SUFFIX}-{}-{}",
+        std::process::id(),
+        unix_time_millis()
+    ));
+
+    let result = (|| -> Result<()> {
+        let mut file = fs::File::create(&partial)
+            .with_context(|| format!("failed to create {}", partial.display()))?;
+        std::io::copy(reader, &mut file)
+            .map_err(|error| disk_space::map_write_error(error, &partial))?;
+        file.sync_all()
+            .with_context(|| format!("failed to flush {}", partial.display()))?;
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        let _ = fs::remove_file(&partial);
+        return Err(error);
+    }
+
+    if let Err(error) = fs::rename(&partial, destination) {
+        let _ = fs::remove_file(&partial);
+        return Err(error).with_context(|| {
+            format!(
+                "failed to move {} into place at {}",
+                partial.display(),
+                destination.display()
+            )
+        });
+    }
     Ok(())
 }
 
@@ -9775,5 +9833,80 @@ last_installed_runtime_id = "therock-release"
             usable_amd_gpu_indices_from(2, Some("GPU-deadbeef".to_owned())),
             None
         );
+    }
+
+    /// Regression: an interrupted transfer must not leave a truncated file at
+    /// the destination. Callers treat any file at that path as a complete,
+    /// cached artifact, so a partial one there poisons the cache permanently.
+    #[test]
+    fn download_leaves_no_truncated_file_at_destination() {
+        use std::io::Read;
+
+        /// Yields a few bytes, then fails — a connection dropped mid-body.
+        struct TruncatedBody {
+            sent: bool,
+        }
+        impl Read for TruncatedBody {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.sent {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "response body closed before all bytes were read",
+                    ));
+                }
+                self.sent = true;
+                let chunk = b"TRUNCATED-BYTES\n";
+                buf[..chunk.len()].copy_from_slice(chunk);
+                Ok(chunk.len())
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("rocm-core-partial-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let cache = dir.join("cache");
+        let dest = cache.join("lemonade.tar.gz");
+
+        let mut body = TruncatedBody { sent: false };
+        stream_to_path_atomically(&mut body, &dest)
+            .expect_err("a body that ends early should surface as an error");
+
+        assert!(
+            !dest.exists(),
+            "truncated download must not be left at {}",
+            dest.display()
+        );
+        let leftovers: Vec<String> = fs::read_dir(&cache)
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            leftovers.is_empty(),
+            "failed download left files behind: {leftovers:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The happy path renames into place and keeps every extension.
+    #[test]
+    fn stream_to_path_atomically_writes_complete_body() {
+        let dir = std::env::temp_dir().join(format!("rocm-core-complete-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let dest = dir.join("cache").join("sdk.tar.gz");
+
+        let mut body = &b"complete-payload"[..];
+        stream_to_path_atomically(&mut body, &dest).expect("complete body should be written");
+
+        assert_eq!(fs::read(&dest).unwrap(), b"complete-payload");
+        let leftovers: Vec<String> = fs::read_dir(dest.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(leftovers, vec!["sdk.tar.gz".to_owned()]);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

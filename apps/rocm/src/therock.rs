@@ -10,8 +10,8 @@ use rocm_core::{
     normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
     normalize_runtime_path_text_for_storage, normalize_therock_family, runtime_is_windows,
     runtime_os_name, runtime_path_for_windows_child, runtime_path_list_split,
-    runtime_python_executable_in_env, unix_time_millis, uv_command_env, uv_pip_install_base,
-    uv_venv_args, verify_rsa_pkcs1_sha256_signature,
+    runtime_python_executable_in_env, stream_to_path_atomically, unix_time_millis, uv_command_env,
+    uv_pip_install_base, uv_venv_args, verify_rsa_pkcs1_sha256_signature,
 };
 #[cfg(test)]
 use rocm_core::{generate_rsa_signing_keypair, sign_rsa_pkcs1_sha256_signature};
@@ -2087,23 +2087,39 @@ fn http_header_value(headers: &str, name: &str) -> Option<String> {
     value
 }
 
+/// Download `url` to `destination`, streaming the body straight to disk.
+///
+/// SDK tarballs are multi-gigabyte, so the body is never held in memory: it is
+/// streamed to a sibling `.part` file and renamed into place once complete.
 fn download_file(url: &str, destination: &Path) -> Result<()> {
     let parent = destination
         .parent()
         .context("download destination has no parent directory")?;
     fs::create_dir_all(parent)?;
-    let response = http_get(url, &[], None)?;
-    if response.status != 200 {
-        bail!("HTTP {} while fetching {url}", response.status);
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_mins(10))
+        .build();
+    let response = match agent.get(url).set("User-Agent", "rocm-cli").call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(status, _)) => bail!("HTTP {status} while fetching {url}"),
+        Err(error) => bail!("HTTP request failed for {url}: {error}"),
+    };
+    // Streaming means the size is not buffered upfront, so the free-space check
+    // keys off `Content-Length` where the server sends one — the same preflight
+    // `download_file_to_path` runs before an engine download.
+    if let Some(content_length) = response
+        .header("Content-Length")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        disk_space::ensure_space_for(
+            &format!("save the download from {url}"),
+            destination,
+            disk_space::with_margin(content_length),
+        )?;
     }
-    // The body is already buffered, so this requirement is exact: refuse before
-    // writing rather than leaving a truncated file behind on a full disk.
-    disk_space::ensure_space_for(
-        &format!("save the download from {url}"),
-        destination,
-        disk_space::with_margin(response.body.len() as u64),
-    )?;
-    write_file_atomically(destination, &response.body)
+    let mut reader = response.into_reader();
+    stream_to_path_atomically(&mut reader, destination)
+        .with_context(|| format!("failed to download {url}"))
 }
 
 /// Content length of `url` from a HEAD request, when the server reports one.
@@ -2269,20 +2285,50 @@ fn windows_child_path(path: &Path) -> String {
     runtime_path_for_windows_child(path)
 }
 
+/// A unique temp path next to `path`, preserving the full file name so a
+/// multi-extension artifact keeps its extensions (`sdk.tar.gz` becomes
+/// `sdk.tar.gz.tmp-<id>`, where `with_extension` would drop `.gz`).
+fn temp_sibling_path(path: &Path) -> Result<PathBuf> {
+    let parent = path.parent().context("file path has no parent directory")?;
+    let file_name = path
+        .file_name()
+        .context("file path has no file name")?
+        .to_string_lossy()
+        .into_owned();
+    Ok(parent.join(format!(
+        "{file_name}.tmp-{}-{}",
+        std::process::id(),
+        unix_time_millis()
+    )))
+}
+
 fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().context("file path has no parent directory")?;
     fs::create_dir_all(parent)?;
-    let tmp = path.with_extension(format!("tmp-{}", unix_time_millis()));
-    {
+    let tmp = temp_sibling_path(path)?;
+    // Clean up the temp file on every failure path. It carries a unique
+    // timestamped name, so leaving it behind would accumulate a fresh orphan
+    // per attempt — and when the failure is a full disk, those orphans are what
+    // keep it full.
+    let write_result = (|| -> Result<()> {
         let mut file = fs::File::create(&tmp)
             .with_context(|| format!("failed to create {}", tmp.display()))?;
         file.write_all(bytes)
             .map_err(|error| disk_space::map_write_error(error, &tmp))?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
     }
-    fs::rename(&tmp, path).or_else(|_| {
-        let _ = fs::remove_file(path);
-        fs::rename(&tmp, path)
-    })?;
+    fs::rename(&tmp, path)
+        .or_else(|_| {
+            let _ = fs::remove_file(path);
+            fs::rename(&tmp, path)
+        })
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })?;
     Ok(())
 }
 
@@ -4532,5 +4578,57 @@ echo Python 3.12.10
             None,
             "invalid calendar dates should not be displayed"
         );
+    }
+
+    /// Regression: a failed write must not leave a `.tmp-*` scratch file
+    /// behind. The name is unique per attempt, so an orphan per retry used to
+    /// accumulate — and when the failure is a full disk, those orphans are
+    /// exactly what keeps it full.
+    ///
+    /// Ignored by default: it fills `/dev/shm` to provoke ENOSPC, which is
+    /// shared with anything else on the host. Run with
+    /// `cargo test -p rocm -- --ignored write_file_atomically_cleans_up`.
+    #[test]
+    #[ignore = "fills /dev/shm to provoke ENOSPC; not safe to run concurrently"]
+    fn write_file_atomically_cleans_up_temp_on_write_failure() {
+        let shm = Path::new("/dev/shm");
+        if !shm.is_dir() {
+            eprintln!("skipping: /dev/shm unavailable");
+            return;
+        }
+        let dir = shm.join(format!("rocm-enospc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("artifact.tar.gz");
+        // Larger than the tmpfs, so the write is guaranteed to hit ENOSPC.
+        let payload = vec![0u8; 256 * 1024 * 1024];
+
+        for _ in 0..2 {
+            write_file_atomically(&dest, &payload)
+                .expect_err("writing past the end of the filesystem should fail");
+            let leftovers: Vec<String> = fs::read_dir(&dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "failed write left files behind: {leftovers:?}"
+            );
+        }
+        assert!(!dest.exists(), "destination must not exist after failure");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The temp name keeps every extension, so a cleanup glob over a cache
+    /// directory can still tell what a leftover was going to be.
+    #[test]
+    fn temp_sibling_path_preserves_multi_dot_file_names() {
+        let temp = temp_sibling_path(Path::new("/tmp/cache/sdk.tar.gz")).unwrap();
+        let name = temp.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with("sdk.tar.gz.tmp-"),
+            "expected the full name to be preserved, got {name}"
+        );
+        assert_eq!(temp.parent().unwrap(), Path::new("/tmp/cache"));
     }
 }
