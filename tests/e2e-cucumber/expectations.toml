@@ -134,7 +134,7 @@ flaky = true
 
 # --- EAI-7383: `rocm help` lists subcommands in declaration order, not
 # alphabetically. Platform-independent (pure CLI help output). ---
-[["help-lists-subcommands-alphabetically"]]
+[["examine-help-lists-subcommands-alphabetically"]]
 when = {}
 bug = "EAI-7383"
 reason = "rocm help lists subcommands in declaration order, not alphabetically."
