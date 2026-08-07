@@ -121,7 +121,13 @@ async fn open_observe_view(world: &mut E2eWorld) {
     let tui = session(world);
     tui.use_detail_size()
         .unwrap_or_else(|e| panic!("failed to enlarge the dashboard: {e}"));
-    tui.send("4")
+    // Unlike the demo-data journeys, these scenarios open the dashboard and
+    // switch tabs with no assertion in between, so the keystroke can land
+    // before the dashboard is reading input. Repeat it until the Observe tab is
+    // actually selected (the `●` marks the active chip), so the step fails only
+    // if the dashboard never gets there — not if it was slow to start.
+    tui.send_until("4", "● Observe", DEFAULT_TIMEOUT)
+        .await
         .unwrap_or_else(|e| panic!("failed to switch to the Observe tab: {e}"));
 }
 

@@ -47,6 +47,10 @@ const DETAIL_COLS: u16 = 120;
 /// poll cadence, not a fixed readiness sleep: every wait has a deadline and
 /// returns the instant its condition holds.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// How long [`TuiSession::send_until`] waits for a key to take effect before
+/// sending it again. Long enough that a busy host is not spammed with repeats,
+/// short enough that several attempts fit inside a normal step timeout.
+const KEY_RESEND_INTERVAL: Duration = Duration::from_millis(500);
 /// Maximum time to let the PTY reader consume the child's final frame after the
 /// process exits. This is bounded so a misbehaving PTY cannot stall a scenario.
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
@@ -276,6 +280,42 @@ impl TuiSession {
             .write_all(bytes.as_bytes())
             .and_then(|()| self.writer.flush())
             .map_err(|e| format!("failed to write to pty: {e}"))
+    }
+
+    /// Send `bytes` until the screen shows `marker`, re-sending on an interval
+    /// until the deadline.
+    ///
+    /// A bare [`send`](Self::send) writes into the pseudo-terminal whether or
+    /// not the application is reading yet, so a keystroke typed during startup
+    /// can be consumed by whatever holds the terminal at that moment and never
+    /// reach the event loop. The key is then simply lost — nothing retries it,
+    /// and the scenario fails much later, in an assertion about a view it never
+    /// left. Re-sending until the expected view appears makes the step depend on
+    /// the application having acted on the key rather than on it having been
+    /// ready when the key was written.
+    ///
+    /// Only safe for idempotent keys (a tab jump, not a toggle).
+    pub async fn send_until(
+        &mut self,
+        bytes: &str,
+        marker: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.send(bytes)?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let attempt = KEY_RESEND_INTERVAL.min(remaining);
+            if self.wait_for_screen(marker, attempt).await.is_ok() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for {marker:?} while repeating {bytes:?}\n{}",
+                    self.framed_screen()
+                ));
+            }
+        }
     }
 
     /// Poll the current screen until it contains `marker`, or fail with a
