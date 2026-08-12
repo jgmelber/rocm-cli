@@ -59,7 +59,9 @@ execution boundary, and whatever GPU access WSL exposes on that machine. The
 GPU preflight is advisory here precisely because GPU-on-WSL is what the lane is
 proving out: where it is unavailable the capability probe resolves those
 scenarios to not-applicable and the rest of the suite still runs. Scenarios the
-product deliberately routes around on WSL carry `@requires-no-wsl`.
+product deliberately routes around on WSL carry `@requires-bare-metal`; the one
+scenario whose premise *is* a WSL host carries `@requires-wsl`, and this is the
+only lane that runs it.
 
 ### What the WSL distro needs
 

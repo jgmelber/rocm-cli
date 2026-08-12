@@ -140,8 +140,8 @@ self-hosted runner can never stall `ci.yml`'s merge-required checks:
 The blocking mock job passes when every applicable scenario is pass-or-xfail with
 no XPASS or unexpected failure; the self-hosted jobs are non-blocking. `e2e-wsl`
 runs the suite in an Ubuntu distro under WSL2 on the Strix Halo box, so it is the
-only lane that exercises `@requires-wsl` scenarios; `@requires-no-wsl` scenarios
-resolve to skip there. Each workflow has its own `e2e-report` job: `ci.yml`'s
+only lane that exercises `@requires-wsl` scenarios; `@requires-bare-metal`
+scenarios resolve to skip there. Each workflow has its own `e2e-report` job: `ci.yml`'s
 consolidates the mock platform, and `e2e-selfhosted.yml`'s consolidates the
 self-hosted platforms.
 
