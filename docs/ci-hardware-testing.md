@@ -61,6 +61,24 @@ proving out: where it is unavailable the capability probe resolves those
 scenarios to not-applicable and the rest of the suite still runs. Scenarios the
 product deliberately routes around on WSL carry `@requires-no-wsl`.
 
+### What the WSL distro needs
+
+The distro needs `pkg-config`, `build-essential` and `libcap-dev` to build the
+workspace; the lane installs them itself where it has passwordless sudo, and
+otherwise fails with the list of what is missing rather than hanging on a
+password prompt.
+
+GPU coverage additionally needs ROCm's WSL passthrough to be complete —
+`/dev/dxg` and dxcore alone are not enough, `librocdxg.so` and its ldconfig
+entry must be present too. `rocm examine` reports the verdict as
+`driver_status: wsl_rocdxg_ready`; anything else (`wsl_rocdxg_missing`,
+`wsl_gpu_plumbing_missing`) means the runtime cannot reach the device even
+though `detected_gfx_target` still names it, because that target is read from
+the Windows-side driver. The capability probe keys `@requires-gpu` on the
+driver verdict rather than the target for exactly this reason, so a distro
+without the passthrough runs the non-GPU suite and reports the GPU scenarios as
+not applicable, instead of failing them on a premise the host cannot meet.
+
 Each workflow has its own consolidated report job (both named `e2e-report`
 internally). `ci.yml`'s `E2E consolidated report` covers the mock platform;
 `e2e-selfhosted.yml`'s `E2E consolidated report (self-hosted)` covers the three
